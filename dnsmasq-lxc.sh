@@ -1,198 +1,173 @@
 #!/usr/bin/env bash
 
 # dnsmasq LXC Configurator for Proxmox VE
-# Installs and configures dnsmasq (DHCP + DNS) on an existing LXC container
+# Installs and configures dnsmasq on an existing LXC container
 # Run this on the Proxmox host
 #
 # Usage: bash dnsmasq-lxc.sh [CTID]
 
 set -Eeo pipefail
 
-# ── Colors & Formatting ──────────────────────────────────────────────────────
-RD="\033[01;31m"
+# ── Colors ───────────────────────────────────────────────────────────────────
 GN="\033[01;32m"
-YW="\033[33m"
 BL="\033[36m"
-BFR="\\r\\033[K"
 BOLD="\033[1m"
 CL="\033[m"
 TAB="  "
+PARTY="🎉"
 
-# ── Helper Functions ─────────────────────────────────────────────────────────
-msg_info() { echo -ne "${TAB}${YW}⏳ $1...${CL}"; }
-msg_ok() { echo -e "${BFR}${TAB}${GN}✔ $1${CL}"; }
-msg_error() { echo -e "${BFR}${TAB}${RD}✖ $1${CL}"; }
+# ── Whiptail Helpers ─────────────────────────────────────────────────────────
+WHIPTAIL_BACKTITLE="Proxmox VE - dnsmasq Configurator"
 
-header_info() {
-  clear
-  cat <<"EOF"
-     _                                 
-  __| |_ __  ___ _ __ ___   __ _ ___  __ _ 
- / _` | '_ \/ __| '_ ` _ \ / _` / __|/ _` |
-| (_| | | | \__ \ | | | | | (_| \__ \ (_| |
- \__,_|_| |_|___/_| |_| |_|\__,_|___/\__, |
-         LXC Configurator Script        |_/ 
-EOF
-  echo ""
+whiptail_msg() {
+  whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$1" --msgbox "$2" 12 60
 }
 
-# ── Preflight Checks ────────────────────────────────────────────────────────
-check_root() {
-  if [[ $EUID -ne 0 ]]; then
-    msg_error "This script must be run as root"
-    exit 1
-  fi
+whiptail_input() {
+  local title="$1" prompt="$2" default="$3"
+  local result
+  result=$(whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$title" \
+    --inputbox "$prompt" 10 60 "$default" 3>&1 1>&2 2>&3) || exit 1
+  echo "$result"
 }
 
-check_pve() {
-  if ! command -v pct &>/dev/null; then
-    msg_error "This script must be run on a Proxmox VE host"
-    exit 1
-  fi
+whiptail_progress() {
+  echo -e "XXX\n${1}\n${2}\nXXX"
 }
+
+# ── Preflight ────────────────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then echo "Run as root"; exit 1; fi
+if ! command -v pct &>/dev/null; then echo "Run on Proxmox host"; exit 1; fi
 
 # ── Container Selection ──────────────────────────────────────────────────────
 select_container() {
   if [[ -n "${1:-}" ]]; then
     CTID="$1"
-  else
-    echo -e "${TAB}${BOLD}Available containers:${CL}\n"
-    pct list | tail -n +2 | while read -r id status lock name; do
-      echo -e "${TAB}  ${GN}${id}${CL} - ${name} (${status})"
-    done
-    echo ""
-    read -rp "${TAB}Enter container ID: " CTID
+    if ! pct status "$CTID" &>/dev/null; then
+      whiptail_msg "Error" "Container ${CTID} does not exist!"
+      exit 1
+    fi
+    return
   fi
 
-  if [[ -z "${CTID:-}" ]]; then
-    msg_error "No container ID provided"
+  # Build menu from running/stopped containers
+  local menu_items=""
+  local count=0
+  while read -r id status lock name; do
+    menu_items="${menu_items} ${id} ${name}_(${status})"
+    ((count++))
+  done < <(pct list | tail -n +2)
+
+  if [[ $count -eq 0 ]]; then
+    whiptail_msg "Error" "No containers found!\nCreate a Debian LXC first."
     exit 1
   fi
 
-  # Verify container exists
-  if ! pct status "$CTID" &>/dev/null; then
-    msg_error "Container ${CTID} does not exist"
-    exit 1
-  fi
-
-  # Get container name
-  CT_NAME=$(pct config "$CTID" | grep '^hostname:' | awk '{print $2}')
-  CT_STATUS=$(pct status "$CTID" | awk '{print $2}')
-
-  msg_ok "Found container ${CTID} (${CT_NAME}) - ${CT_STATUS}"
+  CTID=$(whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
+    --title "Select Container" \
+    --menu "Choose a container to install dnsmasq on:" 16 50 "$count" \
+    $menu_items \
+    3>&1 1>&2 2>&3) || exit 1
 }
 
-# ── Detect Container Network ────────────────────────────────────────────────
+# ── Detect Network ──────────────────────────────────────────────────────────
 detect_network() {
   local net_config
   net_config=$(pct config "$CTID" | grep '^net0:' || echo "")
-
-  # Extract IP if set
   CT_IP=$(echo "$net_config" | grep -oP 'ip=\K[^,]+' || echo "")
   CT_GW=$(echo "$net_config" | grep -oP 'gw=\K[^,]+' || echo "")
   CT_BRIDGE=$(echo "$net_config" | grep -oP 'bridge=\K[^,]+' || echo "")
+  CT_NAME=$(pct config "$CTID" | grep '^hostname:' | awk '{print $2}')
+  CT_STATUS=$(pct status "$CTID" | awk '{print $2}')
 
   if [[ -n "$CT_IP" && "$CT_IP" != "dhcp" ]]; then
     IP_BARE="${CT_IP%%/*}"
-    msg_ok "Detected IP: ${CT_IP} on ${CT_BRIDGE} (gw: ${CT_GW})"
+    local subnet_prefix
+    subnet_prefix=$(echo "$IP_BARE" | cut -d. -f1-3)
+    DHCP_START="${subnet_prefix}.100"
+    DHCP_END="${subnet_prefix}.200"
+    GW_ADVERTISE="${CT_GW:-${subnet_prefix}.1}"
+    DNS_ADVERTISE="$IP_BARE"
   else
     IP_BARE=""
+    DHCP_START="10.10.10.100"
+    DHCP_END="10.10.10.200"
+    GW_ADVERTISE="10.10.10.1"
+    DNS_ADVERTISE="10.10.10.2"
+  fi
+
+  DHCP_LEASE="24h"
+  UPSTREAM_DNS="1.1.1.1"
+  DOMAIN="lan"
+}
+
+# ── Configure Settings ───────────────────────────────────────────────────────
+configure_settings() {
+  local MODE
+  MODE=$(whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
+    --title "Configuration" \
+    --menu "Container: ${CTID} (${CT_NAME})\nDetected IP: ${CT_IP:-none} on ${CT_BRIDGE:-unknown}" 14 60 2 \
+    "1" "Use Defaults (recommended)" \
+    "2" "Advanced Configuration" \
+    3>&1 1>&2 2>&3) || exit 1
+
+  if [[ "$MODE" == "2" ]]; then
+    DHCP_START=$(whiptail_input "DHCP Start" "DHCP range start:" "$DHCP_START")
+    DHCP_END=$(whiptail_input "DHCP End" "DHCP range end:" "$DHCP_END")
+    DHCP_LEASE=$(whiptail_input "Lease Time" "DHCP lease time:" "$DHCP_LEASE")
+    GW_ADVERTISE=$(whiptail_input "Gateway" "Gateway to advertise:" "$GW_ADVERTISE")
+    DNS_ADVERTISE=$(whiptail_input "DNS Server" "DNS server to advertise:" "$DNS_ADVERTISE")
+    UPSTREAM_DNS=$(whiptail_input "Upstream DNS" "Upstream DNS server:" "$UPSTREAM_DNS")
+    DOMAIN=$(whiptail_input "Domain" "Local domain name:" "$DOMAIN")
   fi
 }
 
-# ── DHCP Settings ────────────────────────────────────────────────────────────
-get_dhcp_settings() {
-  # Derive sensible defaults from container IP
-  local subnet_prefix=""
-  if [[ -n "${IP_BARE:-}" ]]; then
-    subnet_prefix=$(echo "$IP_BARE" | cut -d. -f1-3)
-    DHCP_RANGE_START_DEFAULT="${subnet_prefix}.100"
-    DHCP_RANGE_END_DEFAULT="${subnet_prefix}.200"
-    GW_DEFAULT="${CT_GW:-${subnet_prefix}.1}"
-    DNS_DEFAULT="$IP_BARE"
-  else
-    DHCP_RANGE_START_DEFAULT="10.10.10.100"
-    DHCP_RANGE_END_DEFAULT="10.10.10.200"
-    GW_DEFAULT="10.10.10.1"
-    DNS_DEFAULT="10.10.10.2"
-  fi
-
-  DHCP_LEASE_DEFAULT="24h"
-  UPSTREAM_DNS_DEFAULT="1.1.1.1"
-  DOMAIN_DEFAULT="lan"
-
-  echo -e "\n${BOLD}${BL}── DHCP/DNS Settings ──${CL}\n"
-
-  read -rp "${TAB}DHCP range start [${DHCP_RANGE_START_DEFAULT}]: " DHCP_RANGE_START
-  DHCP_RANGE_START="${DHCP_RANGE_START:-$DHCP_RANGE_START_DEFAULT}"
-
-  read -rp "${TAB}DHCP range end [${DHCP_RANGE_END_DEFAULT}]: " DHCP_RANGE_END
-  DHCP_RANGE_END="${DHCP_RANGE_END:-$DHCP_RANGE_END_DEFAULT}"
-
-  read -rp "${TAB}DHCP lease time [${DHCP_LEASE_DEFAULT}]: " DHCP_LEASE
-  DHCP_LEASE="${DHCP_LEASE:-$DHCP_LEASE_DEFAULT}"
-
-  read -rp "${TAB}Gateway to advertise [${GW_DEFAULT}]: " GW_ADVERTISE
-  GW_ADVERTISE="${GW_ADVERTISE:-$GW_DEFAULT}"
-
-  read -rp "${TAB}DNS server to advertise [${DNS_DEFAULT}]: " DNS_ADVERTISE
-  DNS_ADVERTISE="${DNS_ADVERTISE:-$DNS_DEFAULT}"
-
-  read -rp "${TAB}Upstream DNS [${UPSTREAM_DNS_DEFAULT}]: " UPSTREAM_DNS
-  UPSTREAM_DNS="${UPSTREAM_DNS:-$UPSTREAM_DNS_DEFAULT}"
-
-  read -rp "${TAB}Local domain [${DOMAIN_DEFAULT}]: " DOMAIN
-  DOMAIN="${DOMAIN:-$DOMAIN_DEFAULT}"
+# ── Confirm ──────────────────────────────────────────────────────────────────
+confirm_settings() {
+  whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
+    --title "Confirm Settings" \
+    --yesno "\
+CONTAINER\n\
+─────────────────────────────\n\
+  ID:          ${CTID} (${CT_NAME})\n\
+  Status:      ${CT_STATUS}\n\n\
+DHCP\n\
+─────────────────────────────\n\
+  Range:       ${DHCP_START} - ${DHCP_END}\n\
+  Lease:       ${DHCP_LEASE}\n\
+  Router:      ${GW_ADVERTISE}\n\n\
+DNS\n\
+─────────────────────────────\n\
+  Server:      ${DNS_ADVERTISE}\n\
+  Upstream:    ${UPSTREAM_DNS}\n\
+  Domain:      ${DOMAIN}\n\n\
+Install dnsmasq with these settings?" 24 48 || exit 0
 }
 
-show_summary() {
-  echo -e "\n${BOLD}${BL}── Summary ──${CL}\n"
-  echo -e "${TAB}Container:    ${GN}${CTID}${CL} (${CT_NAME})"
-  echo -e "${TAB}DHCP Range:   ${GN}${DHCP_RANGE_START} - ${DHCP_RANGE_END}${CL} (${DHCP_LEASE})"
-  echo -e "${TAB}Router:       ${GN}${GW_ADVERTISE}${CL}"
-  echo -e "${TAB}DNS Server:   ${GN}${DNS_ADVERTISE}${CL}"
-  echo -e "${TAB}Upstream DNS: ${GN}${UPSTREAM_DNS}${CL}"
-  echo -e "${TAB}Domain:       ${GN}${DOMAIN}${CL}"
-  echo ""
+# ── Installation ─────────────────────────────────────────────────────────────
+run_installation() {
+  {
+    # Start container if needed
+    whiptail_progress 5 "Checking container status..."
+    if [[ "$CT_STATUS" != "running" ]]; then
+      pct start "$CTID" &>/dev/null
+      local count=0
+      while [[ $(pct status "$CTID" 2>/dev/null | awk '{print $2}') != "running" ]]; do
+        sleep 1
+        ((count++))
+        [[ $count -ge 30 ]] && break
+      done
+      sleep 2
+    fi
 
-  read -rp "${TAB}Proceed? [Y/n]: " confirm
-  if [[ "${confirm,,}" == "n" ]]; then
-    echo -e "${TAB}Aborted."
-    exit 0
-  fi
-}
+    whiptail_progress 20 "Updating package lists..."
+    pct exec "$CTID" -- bash -c "apt-get update -qq" &>/dev/null
 
-# ── Start Container if Stopped ───────────────────────────────────────────────
-ensure_running() {
-  if [[ "$CT_STATUS" != "running" ]]; then
-    msg_info "Starting container ${CTID}"
-    pct start "$CTID" &>/dev/null
-    local count=0
-    while [[ $(pct status "$CTID" 2>/dev/null | awk '{print $2}') != "running" ]]; do
-      sleep 1
-      ((count++))
-      if [[ $count -ge 30 ]]; then
-        msg_error "Container failed to start within 30s"
-        exit 1
-      fi
-    done
-    sleep 2
-    msg_ok "Started container ${CTID}"
-  fi
-}
+    whiptail_progress 40 "Installing dnsmasq..."
+    pct exec "$CTID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnsmasq" &>/dev/null
 
-# ── Install & Configure dnsmasq ──────────────────────────────────────────────
-install_dnsmasq() {
-  msg_info "Updating package lists"
-  pct exec "$CTID" -- bash -c "apt-get update -qq" &>/dev/null
-  msg_ok "Updated package lists"
-
-  msg_info "Installing dnsmasq"
-  pct exec "$CTID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnsmasq" &>/dev/null
-  msg_ok "Installed dnsmasq"
-
-  msg_info "Configuring dnsmasq"
-  pct exec "$CTID" -- bash -c "cat > /etc/dnsmasq.conf << DNSMASQEOF
+    whiptail_progress 60 "Writing dnsmasq configuration..."
+    pct exec "$CTID" -- bash -c "cat > /etc/dnsmasq.conf << DNSMASQEOF
 # dnsmasq configuration - managed by helper script
 # $(date +%Y-%m-%d)
 
@@ -201,7 +176,7 @@ interface=eth0
 bind-interfaces
 
 # DHCP
-dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${DHCP_LEASE}
+dhcp-range=${DHCP_START},${DHCP_END},${DHCP_LEASE}
 dhcp-option=option:router,${GW_ADVERTISE}
 dhcp-option=option:dns-server,${DNS_ADVERTISE}
 dhcp-option=option:domain-name,${DOMAIN}
@@ -213,10 +188,10 @@ expand-hosts
 server=${UPSTREAM_DNS}
 server=8.8.8.8
 
-# Static DHCP leases (add your own)
+# Static DHCP leases
 # dhcp-host=AA:BB:CC:DD:EE:FF,hostname,10.10.10.10
 
-# Local DNS records (add your own)
+# Local DNS records
 # address=/myapp.${DOMAIN}/10.10.10.10
 
 # Logging
@@ -227,10 +202,9 @@ log-facility=/var/log/dnsmasq.log
 # Performance
 cache-size=1000
 DNSMASQEOF"
-  msg_ok "Configured dnsmasq"
 
-  msg_info "Creating log rotation"
-  pct exec "$CTID" -- bash -c "cat > /etc/logrotate.d/dnsmasq << 'LOGEOF'
+    whiptail_progress 75 "Setting up log rotation..."
+    pct exec "$CTID" -- bash -c "cat > /etc/logrotate.d/dnsmasq << 'LOGEOF'
 /var/log/dnsmasq.log {
     monthly
     missingok
@@ -243,58 +217,60 @@ DNSMASQEOF"
     endscript
 }
 LOGEOF"
-  msg_ok "Created log rotation"
 
-  msg_info "Enabling and starting dnsmasq"
-  pct exec "$CTID" -- systemctl enable dnsmasq &>/dev/null
-  pct exec "$CTID" -- systemctl restart dnsmasq &>/dev/null
-  msg_ok "Enabled and started dnsmasq"
+    whiptail_progress 85 "Starting dnsmasq service..."
+    pct exec "$CTID" -- systemctl enable dnsmasq &>/dev/null
+    pct exec "$CTID" -- systemctl restart dnsmasq &>/dev/null
 
-  msg_info "Verifying dnsmasq"
-  if pct exec "$CTID" -- systemctl is-active dnsmasq &>/dev/null; then
-    msg_ok "dnsmasq is running"
-  else
-    msg_error "dnsmasq failed to start! Check: pct exec ${CTID} -- journalctl -u dnsmasq"
+    whiptail_progress 95 "Verifying..."
+    sleep 1
+
+    whiptail_progress 100 "Complete!"
+    sleep 1
+  } | whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
+      --title "Installing dnsmasq" \
+      --gauge "Starting..." 8 60 0
+
+  # Verify
+  if ! pct exec "$CTID" -- systemctl is-active dnsmasq &>/dev/null; then
+    whiptail_msg "Error" "dnsmasq failed to start!\n\nCheck: pct exec ${CTID} -- journalctl -u dnsmasq"
     exit 1
   fi
 }
 
 # ── Completion ───────────────────────────────────────────────────────────────
 show_completion() {
-  echo ""
-  echo -e "${BOLD}${GN}══════════════════════════════════════════════════${CL}"
-  echo -e "${BOLD}${GN}  ✔ dnsmasq configured successfully!${CL}"
-  echo -e "${BOLD}${GN}══════════════════════════════════════════════════${CL}"
-  echo ""
-  echo -e "${TAB}Container:      ${BL}${CTID}${CL} (${CT_NAME})"
-  echo -e "${TAB}DHCP Range:     ${BL}${DHCP_RANGE_START} - ${DHCP_RANGE_END}${CL}"
-  echo -e "${TAB}DNS Server:     ${BL}${DNS_ADVERTISE}${CL}"
-  echo -e "${TAB}Domain:         ${BL}${DOMAIN}${CL}"
-  echo ""
-  echo -e "${TAB}${YW}Useful commands:${CL}"
-  echo -e "${TAB}  View DHCP leases:   ${GN}pct exec ${CTID} -- cat /var/lib/misc/dnsmasq.leases${CL}"
-  echo -e "${TAB}  View logs:          ${GN}pct exec ${CTID} -- tail -f /var/log/dnsmasq.log${CL}"
-  echo -e "${TAB}  Restart dnsmasq:    ${GN}pct exec ${CTID} -- systemctl restart dnsmasq${CL}"
-  echo -e "${TAB}  Edit config:        ${GN}pct exec ${CTID} -- nano /etc/dnsmasq.conf${CL}"
-  echo ""
+  whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
+    --title "Setup Complete ${PARTY}" \
+    --msgbox "\
+dnsmasq configured successfully!\n\n\
+CONTAINER\n\
+──────────────────────────────\n\
+  ${CTID} (${CT_NAME})\n\n\
+DHCP\n\
+──────────────────────────────\n\
+  Range:  ${DHCP_START} - ${DHCP_END}\n\
+  Router: ${GW_ADVERTISE}\n\n\
+DNS\n\
+──────────────────────────────\n\
+  Server:   ${DNS_ADVERTISE}\n\
+  Domain:   ${DOMAIN}\n\n\
+USEFUL COMMANDS\n\
+──────────────────────────────\n\
+  Leases: pct exec ${CTID} -- cat /var/lib/misc/dnsmasq.leases\n\
+  Logs:   pct exec ${CTID} -- tail -f /var/log/dnsmasq.log\n\
+  Config: pct exec ${CTID} -- nano /etc/dnsmasq.conf" 28 52
+
+  clear
+  echo -e "\n${TAB}${GN}${BOLD}${PARTY} dnsmasq configured on container ${CTID} (${CT_NAME})${CL}\n"
+  echo -e "${TAB}DHCP: ${BL}${DHCP_START} - ${DHCP_END}${CL}"
+  echo -e "${TAB}DNS:  ${BL}${DNS_ADVERTISE}${CL} (domain: ${DOMAIN})\n"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-main() {
-  header_info
-  check_root
-  check_pve
-
-  echo -e "${TAB}This script installs and configures dnsmasq (DHCP + DNS)"
-  echo -e "${TAB}on an existing Proxmox LXC container.\n"
-
-  select_container "${1:-}"
-  detect_network
-  get_dhcp_settings
-  show_summary
-  ensure_running
-  install_dnsmasq
-  show_completion
-}
-
-main "$@"
+select_container "${1:-}"
+detect_network
+configure_settings
+confirm_settings
+run_installation
+show_completion
