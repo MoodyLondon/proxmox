@@ -102,14 +102,11 @@ detect_storage() {
 show_welcome() {
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Internal Network Bootstrap" \
-    --yesno "This script will configure your Proxmox host with:\n\n\
-  • Private bridge (${BRIDGE}) with NAT\n\
-  • IP forwarding for internet access\n\
-  • Debian LXC container with dnsmasq\n\
-  • DHCP server for automatic IP assignment\n\
-  • DNS server for local name resolution\n\n\
-All new containers on ${BRIDGE} with DHCP will get IPs automatically.\n\n\
-Proceed with setup?" 18 64 || exit 0
+    --yesno "This will set up on your Proxmox host:\n\n\
+  • Private bridge with NAT + IP forwarding\n\
+  • Debian LXC with dnsmasq (DHCP + DNS)\n\n\
+New containers on ${BRIDGE} with DHCP get IPs automatically.\n\n\
+Proceed?" 14 58 || exit 0
 }
 
 # ── Simple vs Advanced ───────────────────────────────────────────────────────
@@ -161,24 +158,11 @@ confirm_settings() {
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Confirm Settings" \
     --yesno "\
-HOST NETWORKING\n\
-─────────────────────────────\n\
-  Bridge:        ${BRIDGE} (${HOST_IP}/24)\n\
-  NAT:           ${SUBNET}.0/24 → ${PUBLIC_BRIDGE_NAME}\n\
-  IP Forwarding: enabled\n\n\
-DNSMASQ CONTAINER\n\
-─────────────────────────────\n\
-  ID:            ${CTID} (${CT_HOSTNAME})\n\
-  Resources:     ${CT_CPU} CPU / ${CT_RAM}MB RAM / ${CT_DISK}GB\n\
-  IP:            ${CT_IP}/24\n\
-  Storage:       ${STORAGE}\n\n\
-DHCP / DNS\n\
-─────────────────────────────\n\
-  DHCP Range:    ${DHCP_START} - ${DHCP_END}\n\
-  Lease:         ${DHCP_LEASE}\n\
-  Upstream DNS:  ${UPSTREAM_DNS}\n\
-  Domain:        ${DOMAIN}\n\n\
-Apply these settings?" 28 52 || exit 0
+Bridge: ${BRIDGE} (${HOST_IP}/24) NAT → ${PUBLIC_BRIDGE_NAME}\n\
+CT ${CTID}: ${CT_HOSTNAME} (${CT_CPU}C/${CT_RAM}M/${CT_DISK}G) IP ${CT_IP}\n\
+DHCP: ${DHCP_START}-${DHCP_END} (${DHCP_LEASE})\n\
+DNS: ${UPSTREAM_DNS} Domain: ${DOMAIN}\n\n\
+Apply?" 12 58 || exit 0
 }
 
 # ── Installation (with progress bar) ─────────────────────────────────────────
@@ -440,24 +424,13 @@ show_completion() {
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Setup Complete ${PARTY}" \
     --msgbox "\
-Internal network bootstrapped successfully!\n\n\
-HOST\n\
-─────────────────────────────────\n\
-  Bridge:      ${BRIDGE} (${HOST_IP}/24)\n\
-  NAT:         active\n\
-  Forwarding:  enabled\n\n\
-DNSMASQ (CT ${CTID})\n\
-─────────────────────────────────\n\
-  IP:          ${CT_IP}\n\
-  DHCP Range:  ${DHCP_START} - ${DHCP_END}\n\
-  Domain:      ${DOMAIN}\n\n\
-New containers on ${BRIDGE} with ip=dhcp\n\
-will get IPs automatically.\n\n\
-USEFUL COMMANDS\n\
-─────────────────────────────────\n\
-  Leases:  pct exec ${CTID} -- cat /var/lib/misc/dnsmasq.leases\n\
-  Logs:    pct exec ${CTID} -- tail -f /var/log/dnsmasq.log\n\
-  Config:  pct exec ${CTID} -- nano /etc/dnsmasq.conf" 30 56
+Bridge: ${BRIDGE} (${HOST_IP}/24) NAT active\n\
+dnsmasq CT ${CTID}: ${CT_IP} DHCP ${DHCP_START}-${DHCP_END}\n\
+Domain: ${DOMAIN}  Upstream: ${UPSTREAM_DNS}\n\n\
+Containers on ${BRIDGE} with ip=dhcp get IPs automatically.\n\n\
+Leases: pct exec ${CTID} -- cat /var/lib/misc/dnsmasq.leases\n\
+Logs:   pct exec ${CTID} -- tail -f /var/log/dnsmasq.log\n\
+Config: pct exec ${CTID} -- nano /etc/dnsmasq.conf" 16 62
 
   clear
   echo -e "\n${TAB}${GN}${BOLD}${PARTY} Proxmox internal network bootstrapped successfully!${CL}\n"
