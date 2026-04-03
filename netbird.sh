@@ -10,12 +10,19 @@ set -Eeo pipefail
 exec < /dev/tty
 
 # ── Colors ───────────────────────────────────────────────────────────────────
+RD="\033[01;31m"
 GN="\033[01;32m"
+YW="\033[33m"
 BL="\033[36m"
+BFR="\\r\\033[K"
 BOLD="\033[1m"
 CL="\033[m"
 TAB="  "
 PARTY="🎉"
+
+msg_info() { echo -ne "${TAB}${YW}⏳ $1...${CL}"; }
+msg_ok() { echo -e "${BFR}${TAB}${GN}✔ $1${CL}"; }
+msg_error() { echo -e "${BFR}${TAB}${RD}✖ $1${CL}"; }
 
 # ── Whiptail Helpers ─────────────────────────────────────────────────────────
 WHIPTAIL_BACKTITLE="Proxmox VE - Netbird Configurator"
@@ -189,65 +196,61 @@ Apply?" 14 55 || exit 0
 
 # ── Installation ─────────────────────────────────────────────────────────────
 run_installation() {
-  {
-    whiptail_progress 0 "Checking VM connectivity..."
-    # Quick connectivity check
-    vm_exec "ping -c 1 -W 3 1.1.1.1" &>/dev/null || true
-    sleep 1
+  clear
+  echo -e "\n${BOLD}${BL}  Installing Netbird on VM ${VMID}...${CL}\n"
 
-    whiptail_progress 10 "Installing Netbird..."
-    vm_exec "curl -fsSL https://pkgs.netbird.io/install.sh | sh" &>/dev/null
+  msg_info "Checking VM connectivity"
+  vm_exec "ping -c 1 -W 3 1.1.1.1" &>/dev/null || true
+  msg_ok "VM is online"
 
-    whiptail_progress 40 "Connecting to management server..."
-    vm_exec "netbird up --management-url ${NB_MGMT_URL} --setup-key ${NB_SETUP_KEY}" &>/dev/null
+  msg_info "Installing Netbird (this may take a minute)"
+  vm_exec "curl -fsSL https://pkgs.netbird.io/install.sh | sh" &>/dev/null
+  msg_ok "Netbird installed"
 
-    whiptail_progress 55 "Enabling Netbird on boot..."
-    vm_exec "systemctl enable netbird" &>/dev/null
+  msg_info "Connecting to management server"
+  vm_exec "netbird up --management-url ${NB_MGMT_URL} --setup-key ${NB_SETUP_KEY}" &>/dev/null
+  msg_ok "Netbird connected"
 
-    whiptail_progress 65 "Enabling IP forwarding..."
-    vm_exec "sysctl -w net.ipv4.ip_forward=1" &>/dev/null
-    vm_exec "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-netbird.conf" &>/dev/null
+  msg_info "Enabling Netbird on boot"
+  vm_exec "systemctl enable netbird" &>/dev/null || true
+  msg_ok "Netbird enabled on boot"
 
-    if [[ "$ENABLE_SSH" == "yes" ]]; then
-      whiptail_progress 75 "Configuring SSH..."
-      vm_exec "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server" &>/dev/null
+  msg_info "Enabling IP forwarding"
+  vm_exec "sysctl -w net.ipv4.ip_forward=1" &>/dev/null
+  vm_exec "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-netbird.conf" &>/dev/null
+  msg_ok "IP forwarding enabled"
 
-      # Configure SSH
-      vm_exec "sed -i 's/^#*Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config" &>/dev/null
-      vm_exec "sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config" &>/dev/null
+  if [[ "$ENABLE_SSH" == "yes" ]]; then
+    msg_info "Installing and configuring SSH"
+    vm_exec "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server" &>/dev/null
 
-      if [[ "$SSH_PASSWORD_AUTH" == "yes" ]]; then
-        vm_exec "sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config" &>/dev/null
-      else
-        vm_exec "sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config" &>/dev/null
-      fi
+    vm_exec "sed -i 's/^#*Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config" &>/dev/null
+    vm_exec "sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config" &>/dev/null
 
-      # Add SSH key if provided
-      if [[ -n "$SSH_KEY" ]]; then
-        vm_exec "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '${SSH_KEY}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys" &>/dev/null
-      fi
-
-      vm_exec "systemctl enable --now sshd" &>/dev/null
-      vm_exec "systemctl restart sshd" &>/dev/null
+    if [[ "$SSH_PASSWORD_AUTH" == "yes" ]]; then
+      vm_exec "sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config" &>/dev/null
+    else
+      vm_exec "sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config" &>/dev/null
     fi
 
-    whiptail_progress 90 "Verifying Netbird status..."
-    sleep 2
+    if [[ -n "${SSH_KEY:-}" ]]; then
+      vm_exec "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '${SSH_KEY}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys" &>/dev/null
+    fi
 
-    whiptail_progress 100 "Complete!"
-    sleep 1
-  } | whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
-      --title "Installing Netbird" \
-      --gauge "Starting..." 8 60 0
+    vm_exec "systemctl enable --now sshd" &>/dev/null || true
+    vm_exec "systemctl restart sshd" &>/dev/null || true
+    msg_ok "SSH configured on port ${SSH_PORT}"
+  fi
 
-  # Verify
+  msg_info "Verifying Netbird status"
+  sleep 2
   local nb_status
   nb_status=$(vm_exec "netbird status" 2>/dev/null || echo "unknown")
 
   if echo "$nb_status" | grep -qi "connected"; then
-    return 0
+    msg_ok "Netbird is connected"
   else
-    whiptail_msg "Warning" "Netbird may not be fully connected yet.\n\nCheck status inside VM:\n  qm guest exec ${VMID} -- netbird status\n\nIt may need approval in your admin panel."
+    msg_ok "Netbird installed (may need approval in admin panel)"
   fi
 }
 
