@@ -167,74 +167,37 @@ Apply?" 12 58 || exit 0
 
 # ── Installation (with progress bar) ─────────────────────────────────────────
 run_installation() {
-  (
-    # Step 1: Host networking
-    whiptail_progress 0 "Backing up network configuration..."
-    sleep 1
+  local INSTALL_LOG="/tmp/bootstrap-install.log"
 
-    # Step 2: Create bridge
-    whiptail_progress 10 "Creating bridge ${BRIDGE}..."
-    sleep 1
+  {
+    whiptail_progress 0 "Setting up host networking..."
+    setup_host_networking >> "$INSTALL_LOG" 2>&1
 
-    # Step 3: IP forwarding
-    whiptail_progress 20 "Enabling IP forwarding..."
-    sleep 1
+    whiptail_progress 15 "Downloading Debian template..."
+    download_template >> "$INSTALL_LOG" 2>&1
 
-    # Step 4: Apply networking
-    whiptail_progress 25 "Applying network configuration..."
-    sleep 1
+    whiptail_progress 35 "Creating LXC container ${CTID}..."
+    create_container >> "$INSTALL_LOG" 2>&1
 
-    # Step 5: Download template
-    whiptail_progress 35 "Downloading Debian template..."
-    sleep 1
+    whiptail_progress 50 "Starting container..."
+    start_and_configure_container >> "$INSTALL_LOG" 2>&1
 
-    # Step 6: Create container
-    whiptail_progress 55 "Creating LXC container ${CTID}..."
-    sleep 1
-
-    # Step 7: Start container
-    whiptail_progress 65 "Starting container..."
-    sleep 1
-
-    # Step 8: Configure networking
-    whiptail_progress 70 "Configuring container networking..."
-    sleep 1
-
-    # Step 9: Install dnsmasq
-    whiptail_progress 80 "Installing dnsmasq..."
-    sleep 1
-
-    # Step 10: Configure dnsmasq
-    whiptail_progress 90 "Configuring DHCP and DNS..."
-    sleep 1
+    whiptail_progress 70 "Installing dnsmasq..."
+    install_dnsmasq >> "$INSTALL_LOG" 2>&1
 
     whiptail_progress 100 "Complete!"
     sleep 1
-  ) | whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
+  } | whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
       --title "Installing" \
-      --gauge "Starting..." 8 60 0 &
+      --gauge "Starting..." 8 60 0
 
-  GAUGE_PID=$!
+  # Verify everything actually worked
+  if ! pct exec "$CTID" -- systemctl is-active dnsmasq &>/dev/null; then
+    whiptail_msg "Error" "Installation failed!\n\nCheck log: cat ${INSTALL_LOG}\nOr: pct exec ${CTID} -- journalctl -u dnsmasq"
+    exit 1
+  fi
 
-  # ── Actual installation steps ──────────────────────────────────────────
-
-  # Step 1: Host networking
-  setup_host_networking
-
-  # Step 2: Download template
-  download_template
-
-  # Step 3: Create container
-  create_container
-
-  # Step 4: Start & configure container
-  start_and_configure_container
-
-  # Step 5: Install dnsmasq
-  install_dnsmasq
-
-  # Wait for gauge to finish
-  wait $GAUGE_PID 2>/dev/null || true
+  rm -f "$INSTALL_LOG"
 }
 
 # ── Step 1: Host Networking ──────────────────────────────────────────────────
