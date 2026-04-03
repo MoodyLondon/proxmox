@@ -9,7 +9,7 @@
 set -Eeo pipefail
 exec < /dev/tty
 
-# ── Colors ───────────────────────────────────────────────────────────────────
+# ── Colors & Helpers ─────────────────────────────────────────────────────────
 RD="\033[01;31m"
 GN="\033[01;32m"
 YW="\033[33m"
@@ -38,20 +38,9 @@ whiptail_input() {
   echo "$result"
 }
 
-whiptail_password() {
-  local title="$1" prompt="$2"
-  result=$(whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$title" \
-    --passwordbox "$prompt" 10 60 3>&1 1>&2 2>&3) || exit 1
-  echo "$result"
-}
-
 whiptail_yesno() {
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$1" --yesno "$2" "$3" "$4"
   return $?
-}
-
-whiptail_progress() {
-  echo -e "XXX\n${1}\n${2}\nXXX"
 }
 
 # ── Preflight ────────────────────────────────────────────────────────────────
@@ -69,7 +58,6 @@ select_vm() {
     return
   fi
 
-  # Build menu from VMs
   local menu_items=""
   local count=0
   while read -r id name status mem; do
@@ -90,84 +78,50 @@ select_vm() {
     3>&1 1>&2 2>&3) || exit 1
 }
 
-# ── Check VM is Running ─────────────────────────────────────────────────────
-ensure_vm_running() {
+# ── Check VM ─────────────────────────────────────────────────────────────────
+ensure_vm_ready() {
   local status
   status=$(qm status "$VMID" | awk '{print $2}')
   if [[ "$status" != "running" ]]; then
-    whiptail_msg "Error" "VM ${VMID} is not running!\nStart it first with: qm start ${VMID}"
+    whiptail_msg "Error" "VM ${VMID} is not running!\nStart it first: qm start ${VMID}"
     exit 1
   fi
-}
 
-# ── Check VM has Guest Agent ─────────────────────────────────────────────────
-check_guest_agent() {
-  if ! qm guest exec "$VMID" -- echo "ok" &>/dev/null; then
-    whiptail_msg "Error" "QEMU Guest Agent not responding on VM ${VMID}!\n\nInstall it inside the VM:\n  apt install qemu-guest-agent\n  systemctl enable --now qemu-guest-agent\n\nThen retry this script."
+  # Check guest agent
+  if ! qm guest exec "$VMID" --timeout 5 -- echo "ok" &>/dev/null; then
+    whiptail_msg "Error" "QEMU Guest Agent not responding!\n\nInstall inside VM:\n  apt install qemu-guest-agent\n  systemctl start qemu-guest-agent\n\nThen retry."
     exit 1
   fi
-}
-
-# ── Helper to exec commands in VM ────────────────────────────────────────────
-vm_exec() {
-  local result
-  result=$(qm guest exec "$VMID" -- bash -c "$1" 2>/dev/null)
-  local exit_code
-  exit_code=$(echo "$result" | grep -oP '"exitcode":\K[0-9]+' || echo "1")
-  local out_data
-  out_data=$(echo "$result" | grep -oP '"out-data":"[^"]*"' | sed 's/"out-data":"//;s/"$//' | sed 's/\\n/\n/g')
-  local err_data
-  err_data=$(echo "$result" | grep -oP '"err-data":"[^"]*"' | sed 's/"err-data":"//;s/"$//' | sed 's/\\n/\n/g')
-
-  if [[ -n "$out_data" ]]; then
-    echo -e "$out_data"
-  fi
-  if [[ -n "$err_data" ]]; then
-    echo -e "$err_data" >&2
-  fi
-  return "$exit_code"
 }
 
 # ── Gather Settings ──────────────────────────────────────────────────────────
 gather_settings() {
-  # Welcome
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Netbird Setup" \
-    --yesno "This will install Netbird on VM ${VMID} and configure\nit as a subnet router for your internal network.\n\nYou'll need:\n  • Management URL\n  • Setup key from your Netbird admin panel\n\nProceed?" 14 58 || exit 0
+    --yesno "Install Netbird on VM ${VMID} as a subnet router.\n\nYou need:\n  • Management URL\n  • Setup key\n\nProceed?" 12 55 || exit 0
 
-  # Management URL
   NB_MGMT_URL=$(whiptail_input "Management URL" "Netbird management URL:" "https://netbird.example.com")
+  [[ -z "$NB_MGMT_URL" ]] && { whiptail_msg "Error" "Management URL required!"; exit 1; }
 
-  if [[ -z "$NB_MGMT_URL" ]]; then
-    whiptail_msg "Error" "Management URL is required!"
-    exit 1
-  fi
-
-  # Setup key
   NB_SETUP_KEY=$(whiptail_input "Setup Key" "Netbird setup key:" "")
+  [[ -z "$NB_SETUP_KEY" ]] && { whiptail_msg "Error" "Setup key required!"; exit 1; }
 
-  if [[ -z "$NB_SETUP_KEY" ]]; then
-    whiptail_msg "Error" "Setup key is required!"
-    exit 1
-  fi
+  NB_SUBNET=$(whiptail_input "Subnet Route" "Subnet to advertise:" "10.10.10.0/24")
 
-  # Subnet to route
-  NB_SUBNET=$(whiptail_input "Subnet Route" "Subnet to advertise via Netbird:" "10.10.10.0/24")
-
-  # Enable SSH?
   ENABLE_SSH="no"
-  if whiptail_yesno "Enable SSH" "Enable SSH server on the VM?\n\nThis allows you to SSH into the Netbird VM\nthrough the VPN." 12 50; then
-    ENABLE_SSH="yes"
+  SSH_PORT="22"
+  SSH_KEY=""
+  SSH_PASSWORD_AUTH="yes"
 
+  if whiptail_yesno "Enable SSH" "Enable SSH on the VM?" 8 40; then
+    ENABLE_SSH="yes"
     SSH_PORT=$(whiptail_input "SSH Port" "SSH port:" "22")
 
-    if whiptail_yesno "SSH Key" "Add an SSH public key for root?\n\n(Recommended over password auth)" 10 50; then
-      SSH_KEY=$(whiptail_input "SSH Key" "Paste your SSH public key:" "")
-    else
-      SSH_KEY=""
+    if whiptail_yesno "SSH Key" "Add an SSH public key?" 8 40; then
+      SSH_KEY=$(whiptail_input "SSH Key" "Paste your public key:" "")
     fi
 
-    if whiptail_yesno "Password Auth" "Allow password authentication?\n\n(Less secure, but useful as fallback)" 10 50; then
+    if whiptail_yesno "Password Auth" "Allow password authentication?" 8 45; then
       SSH_PASSWORD_AUTH="yes"
     else
       SSH_PASSWORD_AUTH="no"
@@ -178,123 +132,179 @@ gather_settings() {
 # ── Confirm ──────────────────────────────────────────────────────────────────
 confirm_settings() {
   local ssh_info="disabled"
-  if [[ "$ENABLE_SSH" == "yes" ]]; then
-    ssh_info="port ${SSH_PORT}, pw-auth: ${SSH_PASSWORD_AUTH}"
-  fi
+  [[ "$ENABLE_SSH" == "yes" ]] && ssh_info="port ${SSH_PORT}"
 
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
-    --title "Confirm Settings" \
+    --title "Confirm" \
     --yesno "\
-VM:         ${VMID}\n\
-Management: ${NB_MGMT_URL}\n\
-Setup Key:  ${NB_SETUP_KEY:0:8}...\n\
-Subnet:     ${NB_SUBNET}\n\
-SSH:        ${ssh_info}\n\
-Auto-start: yes\n\n\
-Apply?" 14 55 || exit 0
+VM: ${VMID}  Management: ${NB_MGMT_URL}\n\
+Key: ${NB_SETUP_KEY:0:8}...  Subnet: ${NB_SUBNET}\n\
+SSH: ${ssh_info}  Auto-start: yes\n\n\
+Apply?" 10 58 || exit 0
 }
 
-# ── Installation ─────────────────────────────────────────────────────────────
-run_installation() {
-  clear
-  echo -e "\n${BOLD}${BL}  Installing Netbird on VM ${VMID}...${CL}\n"
+# ── Generate Install Script ──────────────────────────────────────────────────
+generate_install_script() {
+  INSTALL_SCRIPT=$(cat << SCRIPTEOF
+#!/bin/bash
+set -e
 
-  msg_info "Checking VM connectivity"
-  vm_exec "ping -c 1 -W 3 1.1.1.1" &>/dev/null || true
-  msg_ok "VM is online"
+echo ">>> Installing Netbird..."
+curl -fsSL https://pkgs.netbird.io/install.sh | sh
 
-  msg_info "Installing Netbird (this may take a minute)"
-  vm_exec "curl -fsSL https://pkgs.netbird.io/install.sh | sh" &>/dev/null
-  msg_ok "Netbird installed"
+echo ">>> Connecting to management server..."
+netbird up --management-url ${NB_MGMT_URL} --setup-key ${NB_SETUP_KEY}
 
-  msg_info "Connecting to management server"
-  vm_exec "netbird up --management-url ${NB_MGMT_URL} --setup-key ${NB_SETUP_KEY}" &>/dev/null
-  msg_ok "Netbird connected"
+echo ">>> Enabling Netbird on boot..."
+systemctl enable netbird 2>/dev/null || true
 
-  msg_info "Enabling Netbird on boot"
-  vm_exec "systemctl enable netbird" &>/dev/null || true
-  msg_ok "Netbird enabled on boot"
+echo ">>> Enabling IP forwarding..."
+sysctl -w net.ipv4.ip_forward=1
+mkdir -p /etc/sysctl.d
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-netbird.conf
 
-  msg_info "Enabling IP forwarding"
-  vm_exec "sysctl -w net.ipv4.ip_forward=1" &>/dev/null
-  vm_exec "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-netbird.conf" &>/dev/null
-  msg_ok "IP forwarding enabled"
+SCRIPTEOF
+)
 
   if [[ "$ENABLE_SSH" == "yes" ]]; then
-    msg_info "Installing and configuring SSH"
-    vm_exec "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server" &>/dev/null
+    INSTALL_SCRIPT+=$(cat << SSHEOF
 
-    vm_exec "sed -i 's/^#*Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config" &>/dev/null
-    vm_exec "sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config" &>/dev/null
+echo ">>> Configuring SSH..."
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
 
-    if [[ "$SSH_PASSWORD_AUTH" == "yes" ]]; then
-      vm_exec "sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config" &>/dev/null
-    else
-      vm_exec "sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config" &>/dev/null
+sed -i 's/^#*Port .*/Port ${SSH_PORT}/' /etc/ssh/sshd_config
+sed -i 's/^#*PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication ${SSH_PASSWORD_AUTH}/' /etc/ssh/sshd_config
+
+SSHEOF
+)
+
+    if [[ -n "$SSH_KEY" ]]; then
+      INSTALL_SCRIPT+=$(cat << KEYEOF
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+echo '${SSH_KEY}' >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+KEYEOF
+)
     fi
 
-    if [[ -n "${SSH_KEY:-}" ]]; then
-      vm_exec "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '${SSH_KEY}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys" &>/dev/null
-    fi
+    INSTALL_SCRIPT+=$(cat << SSHENDEOF
 
-    vm_exec "systemctl enable --now sshd" &>/dev/null || true
-    vm_exec "systemctl restart sshd" &>/dev/null || true
-    msg_ok "SSH configured on port ${SSH_PORT}"
+systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true
+systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+
+SSHENDEOF
+)
   fi
 
+  INSTALL_SCRIPT+=$(cat << ENDEOF
+
+echo ">>> Verifying..."
+netbird status
+echo ">>> Done!"
+ENDEOF
+)
+}
+
+# ── Push & Execute ───────────────────────────────────────────────────────────
+run_installation() {
+  clear
+  echo -e "\n${BOLD}${BL}  Installing Netbird on VM ${VMID}${CL}\n"
+
+  msg_info "Pushing install script to VM"
+  # Write install script into the VM
+  printf '%s' "$INSTALL_SCRIPT" | qm guest exec "$VMID" --timeout 10 -- bash -c "cat > /tmp/netbird-install.sh && chmod +x /tmp/netbird-install.sh" &>/dev/null
+  msg_ok "Install script pushed"
+
+  msg_info "Running install script (this may take a few minutes)"
+  echo ""
+
+  # Execute with generous timeout and show output
+  local result
+  result=$(qm guest exec "$VMID" --timeout 300 -- bash /tmp/netbird-install.sh 2>&1) || true
+
+  # Parse and display output
+  local out_data
+  out_data=$(echo "$result" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if 'out-data' in data:
+        print(data['out-data'], end='')
+    if 'err-data' in data:
+        print(data['err-data'], end='', file=sys.stderr)
+except:
+    print(sys.stdin.read(), end='')
+" 2>&1) || out_data="$result"
+
+  # Show output line by line with formatting
+  while IFS= read -r line; do
+    if [[ "$line" == ">>>"* ]]; then
+      msg_ok "${line#>>> }"
+    elif [[ -n "$line" ]]; then
+      echo -e "${TAB}  ${line}"
+    fi
+  done <<< "$out_data"
+
+  echo ""
+
+  # Verify
   msg_info "Verifying Netbird status"
-  sleep 2
+  local status_result
+  status_result=$(qm guest exec "$VMID" --timeout 10 -- netbird status 2>&1) || true
   local nb_status
-  nb_status=$(vm_exec "netbird status" 2>/dev/null || echo "unknown")
+  nb_status=$(echo "$status_result" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('out-data', ''), end='')
+except:
+    print(sys.stdin.read(), end='')
+" 2>&1) || nb_status="$status_result"
 
   if echo "$nb_status" | grep -qi "connected"; then
     msg_ok "Netbird is connected"
   else
     msg_ok "Netbird installed (may need approval in admin panel)"
   fi
+
+  # Cleanup
+  qm guest exec "$VMID" --timeout 5 -- rm -f /tmp/netbird-install.sh &>/dev/null || true
 }
 
 # ── Completion ───────────────────────────────────────────────────────────────
 show_completion() {
   local ssh_info=""
-  if [[ "$ENABLE_SSH" == "yes" ]]; then
-    ssh_info="\nSSH: port ${SSH_PORT} enabled"
-  fi
+  [[ "$ENABLE_SSH" == "yes" ]] && ssh_info="\nSSH: port ${SSH_PORT} enabled"
 
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Setup Complete ${PARTY}" \
     --msgbox "\
 Netbird installed on VM ${VMID}\n\
-Management: ${NB_MGMT_URL}\n\
-Subnet: ${NB_SUBNET}\n\
-Auto-start: enabled${ssh_info}\n\n\
-NEXT STEPS\n\
-──────────────────────────────\n\
-1. Open Netbird admin panel\n\
-2. Find this peer and add route:\n\
+Subnet: ${NB_SUBNET}  Auto-start: yes${ssh_info}\n\n\
+Next steps:\n\
+1. Add route in Netbird admin panel:\n\
    Network: ${NB_SUBNET}\n\
-3. Test: ping 10.10.10.1 from\n\
-   another Netbird peer\n\
-4. Then lock down Hetzner firewall" 18 50
+2. Test: ping 10.10.10.1\n\
+3. Lock down Hetzner firewall" 16 50
 
   clear
   echo -e "\n${TAB}${GN}${BOLD}${PARTY} Netbird configured on VM ${VMID}${CL}\n"
   echo -e "${TAB}Management: ${BL}${NB_MGMT_URL}${CL}"
   echo -e "${TAB}Subnet:     ${BL}${NB_SUBNET}${CL}"
-  echo -e "${TAB}Auto-start: ${BL}enabled${CL}"
-  if [[ "$ENABLE_SSH" == "yes" ]]; then
-    echo -e "${TAB}SSH:        ${BL}port ${SSH_PORT}${CL}"
-  fi
+  [[ "$ENABLE_SSH" == "yes" ]] && echo -e "${TAB}SSH:        ${BL}port ${SSH_PORT}${CL}"
   echo ""
-  echo -e "${TAB}Add the subnet route in your Netbird admin panel,"
-  echo -e "${TAB}then test access to ${BL}10.10.10.1:8006${CL} through VPN.\n"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 select_vm "${1:-}"
-ensure_vm_running
-check_guest_agent
+ensure_vm_ready
 gather_settings
 confirm_settings
+generate_install_script
 run_installation
 show_completion
