@@ -127,21 +127,11 @@ confirm_settings() {
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Confirm Settings" \
     --yesno "\
-CONTAINER\n\
-─────────────────────────────\n\
-  ID:          ${CTID} (${CT_NAME})\n\
-  Status:      ${CT_STATUS}\n\n\
-DHCP\n\
-─────────────────────────────\n\
-  Range:       ${DHCP_START} - ${DHCP_END}\n\
-  Lease:       ${DHCP_LEASE}\n\
-  Router:      ${GW_ADVERTISE}\n\n\
-DNS\n\
-─────────────────────────────\n\
-  Server:      ${DNS_ADVERTISE}\n\
-  Upstream:    ${UPSTREAM_DNS}\n\
-  Domain:      ${DOMAIN}\n\n\
-Install dnsmasq with these settings?" 24 48 || exit 0
+CT ${CTID} (${CT_NAME}) - ${CT_STATUS}\n\
+DHCP: ${DHCP_START}-${DHCP_END} (${DHCP_LEASE})\n\
+Router: ${GW_ADVERTISE}  DNS: ${DNS_ADVERTISE}\n\
+Upstream: ${UPSTREAM_DNS}  Domain: ${DOMAIN}\n\n\
+Install dnsmasq?" 12 55 || exit 0
 }
 
 # ── Installation ─────────────────────────────────────────────────────────────
@@ -243,23 +233,12 @@ show_completion() {
   whiptail --backtitle "$WHIPTAIL_BACKTITLE" \
     --title "Setup Complete ${PARTY}" \
     --msgbox "\
-dnsmasq configured successfully!\n\n\
-CONTAINER\n\
-──────────────────────────────\n\
-  ${CTID} (${CT_NAME})\n\n\
-DHCP\n\
-──────────────────────────────\n\
-  Range:  ${DHCP_START} - ${DHCP_END}\n\
-  Router: ${GW_ADVERTISE}\n\n\
-DNS\n\
-──────────────────────────────\n\
-  Server:   ${DNS_ADVERTISE}\n\
-  Domain:   ${DOMAIN}\n\n\
-USEFUL COMMANDS\n\
-──────────────────────────────\n\
-  Leases: pct exec ${CTID} -- cat /var/lib/misc/dnsmasq.leases\n\
-  Logs:   pct exec ${CTID} -- tail -f /var/log/dnsmasq.log\n\
-  Config: pct exec ${CTID} -- nano /etc/dnsmasq.conf" 28 52
+dnsmasq configured on CT ${CTID} (${CT_NAME})\n\
+DHCP: ${DHCP_START}-${DHCP_END}  Router: ${GW_ADVERTISE}\n\
+DNS: ${DNS_ADVERTISE}  Domain: ${DOMAIN}\n\n\
+Leases: pct exec ${CTID} -- cat /var/lib/misc/dnsmasq.leases\n\
+Logs:   pct exec ${CTID} -- tail -f /var/log/dnsmasq.log\n\
+Config: pct exec ${CTID} -- nano /etc/dnsmasq.conf" 14 62
 
   clear
   echo -e "\n${TAB}${GN}${BOLD}${PARTY} dnsmasq configured on container ${CTID} (${CT_NAME})${CL}\n"
