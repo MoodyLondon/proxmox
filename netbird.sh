@@ -68,7 +68,7 @@ select_vm() {
   while read -r id name status mem; do
     [[ "$id" == "VMID" ]] && continue
     menu_items="${menu_items} ${id} ${name}_(${status})"
-    ((count++))
+    ((count++)) || true
   done < <(qm list 2>/dev/null)
 
   if [[ $count -eq 0 ]]; then
