@@ -67,7 +67,7 @@ DOMAIN_DEFAULT="lan"
 
 # ── Storage Detection ────────────────────────────────────────────────────────
 get_storage() {
-  local -a storages
+  local -a storages=()
   while read -r name type status; do
     [[ "$status" == "active" ]] && storages+=("$name")
   done < <(pvesm status -content rootdir 2>/dev/null | tail -n +2)
